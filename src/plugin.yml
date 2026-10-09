@@ -1,0 +1,9 @@
+name: OtpGate
+version: 1.0.0
+main: dev.rei.otpgate.OtpGate
+api-version: '1.21.11'
+description: Authenticator-app login, no password (TOTP + one-time setup codes)
+commands:
+  otp:
+    description: Log in with your authenticator code, or set it up
+    usage: /otp <code> | /otp setup <setupcode> | /otp confirm <code>
