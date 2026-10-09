@@ -14,6 +14,18 @@ import java.util.Set;
 import java.util.UUID;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
+import com.google.zxing.BarcodeFormat;
+import com.google.zxing.EncodeHintType;
+import com.google.zxing.common.BitMatrix;
+import com.google.zxing.qrcode.QRCodeWriter;
+import org.bukkit.Material;
+import org.bukkit.NamespacedKey;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.MapMeta;
+import org.bukkit.map.MapCanvas;
+import org.bukkit.map.MapRenderer;
+import org.bukkit.map.MapView;
+import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.Location;
@@ -61,17 +73,22 @@ import org.bukkit.plugin.java.JavaPlugin;
 public final class OtpGate extends JavaPlugin implements Listener {
     private static final String B32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
     private static final long SESSION_MS = 10 * 60 * 1000L;   // same IP within 10 min: no code needed
-    private static final int KICK_AFTER_S = 120;
+    private static final int KICK_AFTER_S = 120;          // log in with a code
+    private static final int SETUP_KICK_S = 600;          // first-time setup: time to add the key to an app
+    static final String ISSUER = "node07";
     private final SecureRandom rng = new SecureRandom();
     private final Set<UUID> locked = new HashSet<>();
     private final Map<UUID, Location> anchor = new HashMap<>();
     private final Map<UUID, Integer> fails = new HashMap<>();
+    private final Map<UUID, Object[]> stash = new HashMap<>();   // {slot, the item the QR map replaced}
+    private NamespacedKey qrTag;
     private File file;
     private YamlConfiguration db;
 
     @Override
     public void onEnable() {
         getDataFolder().mkdirs();
+        qrTag = new NamespacedKey(this, "otpqr");
         file = new File(getDataFolder(), "players.yml");
         db = YamlConfiguration.loadConfiguration(file);
         db.options().pathSeparator('/');   // Bedrock names start with '.', the default separator
@@ -195,16 +212,19 @@ public final class OtpGate extends JavaPlugin implements Listener {
             return;
         }
         lock(p);
-        prompt(p);
+        String pending = db.getString(k + "/pending");
+        if (pending != null) showSetup(p, pending); else prompt(p);
         UUID id = p.getUniqueId();
+        long wait = db.getBoolean(k + "/confirmed") ? KICK_AFTER_S : SETUP_KICK_S;
         Bukkit.getScheduler().runTaskLater(this, () -> {
             Player q = Bukkit.getPlayer(id);
             if (q != null && locked.contains(id)) q.kickPlayer("No authenticator code entered in time.");
-        }, KICK_AFTER_S * 20L);
+        }, wait * 20L);
     }
 
     @EventHandler
     public void onQuit(PlayerQuitEvent e) {
+        removeQr(e.getPlayer());
         locked.remove(e.getPlayer().getUniqueId());
         anchor.remove(e.getPlayer().getUniqueId());
         fails.remove(e.getPlayer().getUniqueId());
@@ -223,6 +243,10 @@ public final class OtpGate extends JavaPlugin implements Listener {
             if (check(p.getName(), secret, a[0])) unlock(p); else wrong(p);
             return true;
         }
+        if (a.length == 1 && a[0].equalsIgnoreCase("setup") && db.getString(k + "/pending") != null) {
+            showSetup(p, db.getString(k + "/pending"));
+            return true;
+        }
         if (a.length == 2 && a[0].equalsIgnoreCase("setup")) {
             String hash = db.getString(k + "/setupHash");
             if (hash == null || !hash.equals(sha256(a[1].trim().toLowerCase(Locale.ROOT)))) { wrong(p); return true; }
@@ -230,10 +254,7 @@ public final class OtpGate extends JavaPlugin implements Listener {
             db.set(k + "/pending", secret);
             db.set(k + "/setupHash", null);   // one time
             save();
-            p.sendMessage(ChatColor.AQUA + "Add this key to your authenticator app (Google Authenticator, Authy...): "
-                    + "choose 'enter a setup key', account " + ChatColor.WHITE + p.getName() + ChatColor.AQUA + ", key:");
-            p.sendMessage(ChatColor.WHITE + "" + ChatColor.BOLD + secret.replaceAll("(.{4})", "$1 ").trim());
-            p.sendMessage(ChatColor.AQUA + "Then type " + ChatColor.WHITE + "/otp confirm <6-digit code>");
+            showSetup(p, secret);
             getLogger().info(p.getName() + " started OTP setup");
             return true;
         }
@@ -245,12 +266,77 @@ public final class OtpGate extends JavaPlugin implements Listener {
             db.set(k + "/pending", null);
             db.set(k + "/confirmed", true);
             save();
+            removeQr(p);
             p.sendMessage(ChatColor.GREEN + "Authenticator set up. From now on, log in with /otp <code>.");
             if (locked.contains(p.getUniqueId())) unlock(p);
             return true;
         }
         prompt(p);
         return true;
+    }
+
+    static String otpauth(String name, String secret) {
+        String label = (ISSUER + ":" + name).replace(" ", "%20");
+        return "otpauth://totp/" + label + "?secret=" + secret + "&issuer=" + ISSUER
+                + "&algorithm=SHA1&digits=6&period=30";
+    }
+
+    private void showSetup(Player p, String secret) {
+        p.sendMessage(ChatColor.AQUA + "Setup (only you can see this). Scan the QR map in your hand with your "
+                + "authenticator app, or enter this key by hand:");
+        p.sendMessage(ChatColor.WHITE + "" + ChatColor.BOLD + secret.replaceAll("(.{4})", "$1 ").trim());
+        p.sendMessage(ChatColor.GRAY + "Type: time-based (TOTP), SHA1, 6 digits, 30 s. Account: " + p.getName()
+                + ", issuer: " + ISSUER + " (optional). You have " + SETUP_KICK_S / 60 + " minutes.");
+        p.sendMessage(ChatColor.AQUA + "Then type " + ChatColor.WHITE + "/otp confirm <6-digit code>"
+                + ChatColor.AQUA + ". Lost this screen? " + ChatColor.WHITE + "/otp setup");
+        giveQr(p, otpauth(p.getName(), secret));
+    }
+
+    private void giveQr(Player p, String text) {
+        removeQr(p);
+        BitMatrix m;
+        try {
+            m = new QRCodeWriter().encode(text, BarcodeFormat.QR_CODE, 0, 0, Map.of(EncodeHintType.MARGIN, 2));
+        } catch (Exception e) { getLogger().warning("QR encode failed: " + e); return; }
+        MapView view = Bukkit.createMap(p.getWorld());
+        for (MapRenderer r : view.getRenderers()) view.removeRenderer(r);
+        view.setTrackingPosition(false);
+        view.setUnlimitedTracking(false);
+        final BitMatrix bm = m;
+        view.addRenderer(new MapRenderer(false) {
+            private boolean drawn;
+            @Override public void render(MapView v, MapCanvas c, Player who) {
+                if (drawn) return;
+                int w = bm.getWidth(), s = Math.max(1, 128 / w), off = (128 - w * s) / 2;
+                for (int x = 0; x < 128; x++) for (int y = 0; y < 128; y++) c.setPixelColor(x, y, java.awt.Color.WHITE);
+                for (int x = 0; x < w; x++) for (int y = 0; y < w; y++) if (bm.get(x, y))
+                    for (int dx = 0; dx < s; dx++) for (int dy = 0; dy < s; dy++)
+                        c.setPixelColor(off + x * s + dx, off + y * s + dy, java.awt.Color.BLACK);
+                drawn = true;
+            }
+        });
+        ItemStack map = new ItemStack(Material.FILLED_MAP);
+        MapMeta meta = (MapMeta) map.getItemMeta();
+        meta.setMapView(view);
+        meta.setDisplayName(ChatColor.AQUA + "Authenticator QR (" + p.getName() + ")");
+        meta.getPersistentDataContainer().set(qrTag, PersistentDataType.BYTE, (byte) 1);
+        map.setItemMeta(meta);
+        int slot = p.getInventory().getHeldItemSlot();
+        stash.put(p.getUniqueId(), new Object[]{slot, p.getInventory().getItem(slot)});
+        p.getInventory().setItem(slot, map);
+    }
+
+    /** Take every QR map back (it carries the secret) and return the item it replaced. */
+    private void removeQr(Player p) {
+        var inv = p.getInventory();
+        for (int i = 0; i < inv.getSize(); i++) {
+            ItemStack it = inv.getItem(i);
+            if (it != null && it.hasItemMeta() && it.getItemMeta().getPersistentDataContainer().has(qrTag, PersistentDataType.BYTE)) {
+                inv.setItem(i, null);
+            }
+        }
+        Object[] s = stash.remove(p.getUniqueId());
+        if (s != null && inv.getItem((int) s[0]) == null) inv.setItem((int) s[0], (ItemStack) s[1]);
     }
 
     private void wrong(Player p) {

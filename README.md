@@ -13,4 +13,4 @@ FishNet attack, replacing AuthMe (which can only add 2FA on top of a password; S
 
 Build (no build tool): copy the server's `/minecraft/libraries` jars to `libs/`, then
 `javac --release 21 -cp "<all libs jars>" -d out src/dev/rei/otpgate/OtpGate.java`, copy `src/plugin.yml`
-into `out/`, and zip `out/` as `OtpGate-1.0.0.jar`. Tested against the RFC 6238 vectors.
+into `out/`, and zip `out/` plus the `com/google/zxing/**` classes of zxing core 3.5.3 (Maven Central, sha1 ca1349214a356cd7958651b2d5a0e1f3811a9c4b) as `OtpGate-1.1.0.jar`; add the zxing jar to the javac classpath. Tested against the RFC 6238 vectors.
