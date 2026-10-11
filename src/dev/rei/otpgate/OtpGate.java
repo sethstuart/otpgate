@@ -32,6 +32,7 @@ import org.bukkit.Location;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.command.ConsoleCommandSender;
+import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -84,23 +85,58 @@ public final class OtpGate extends JavaPlugin implements Listener {
     private NamespacedKey qrTag;
     private File file;
     private YamlConfiguration db;
+    private boolean readOnly;
 
     @Override
     public void onEnable() {
         getDataFolder().mkdirs();
         qrTag = new NamespacedKey(this, "otpqr");
         file = new File(getDataFolder(), "players.yml");
-        db = YamlConfiguration.loadConfiguration(file);
-        db.options().pathSeparator('/');   // Bedrock names start with '.', the default separator
+        // The separator must be set BEFORE the file is parsed. 1.1.0 loaded first and set '/' after, so every restart
+        // re-read players.yml with '.' as the separator and a Bedrock key ".name" came back as "name": the player's
+        // record was still on disk but no longer found, and they were asked to set up again (2026-10-11, .RawKnees8138).
+        db = new YamlConfiguration();
+        db.options().pathSeparator('/');
+        if (file.exists()) {
+            try { db.load(file); } catch (Exception e) {
+                // never overwrite an unreadable store with an empty one: keep it, refuse to save, and fail closed
+                readOnly = true;
+                getLogger().severe("players.yml could not be read (" + e + "); nobody can log in until it is fixed");
+            }
+        }
         getServer().getPluginManager().registerEvents(this, this);
         for (Player p : Bukkit.getOnlinePlayers()) lock(p);   // a reload never leaves anyone unlocked
     }
 
     private void save() {
+        if (readOnly) { getLogger().severe("players.yml is unreadable; not saving over it"); return; }
         try { db.save(file); } catch (IOException e) { getLogger().severe("save failed: " + e); }
     }
 
-    private static String key(String name) { return "players/" + name.toLowerCase(Locale.ROOT); }
+    /** The store key for a player. Floodgate prefixes Bedrock names with '.', so a Bedrock player is stored as
+     *  "bedrock_<name>": no key ever carries a dot, whatever separator the file is read with. */
+    static String key(String name) {
+        String n = name.toLowerCase(Locale.ROOT);
+        return "players/" + (n.startsWith(".") ? "bedrock_" + n.substring(1) : n);
+    }
+
+    /** Move a Bedrock player's 1.1.0 record to its 1.1.1 key, once: stored as ".name", which a restart turned
+     *  into "name". Only for dotted (Floodgate) names, and only when the new key is still empty. */
+    private void migrateLegacy(String name) {
+        if (!name.startsWith(".")) return;
+        String nk = key(name);
+        if (db.isConfigurationSection(nk)) return;
+        String lower = name.toLowerCase(Locale.ROOT);
+        for (String old : new String[]{"players/" + lower, "players/" + lower.substring(1)}) {
+            ConfigurationSection s = db.getConfigurationSection(old);
+            if (s == null) continue;
+            for (String f : s.getKeys(false)) db.set(nk + "/" + f, s.get(f));
+            db.set(old, null);
+            save();
+            getLogger().info("migrated " + name + "'s record from " + old + " to " + nk);
+            return;
+        }
+    }
 
     // ------------------------------------------------------------------------------------------- TOTP
     static String newSecret(SecureRandom r) {
@@ -203,6 +239,7 @@ public final class OtpGate extends JavaPlugin implements Listener {
     @EventHandler(priority = EventPriority.LOWEST)
     public void onJoin(PlayerJoinEvent e) {
         Player p = e.getPlayer();
+        migrateLegacy(p.getName());
         String k = key(p.getName());
         boolean fresh = db.getBoolean(k + "/confirmed")
                 && ip(p).equals(db.getString(k + "/lastIp"))
